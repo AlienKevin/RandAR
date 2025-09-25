@@ -44,6 +44,19 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 
+def create_npz_from_samples_memory(samples_list, npz_path, total_samples):
+    """
+    Creates NPZ file directly from samples in memory.
+    """
+    if len(samples_list) > 0:
+        # Stack all samples into a single numpy array
+        samples = np.stack(samples_list)
+        assert samples.shape == (total_samples, samples.shape[1], samples.shape[2], 3)
+        np.savez(npz_path, arr_0=samples)
+        print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
+    return npz_path
+
+
 def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
     # Setup DDP:
     dist.init_process_group("nccl")
@@ -72,8 +85,8 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
 
     if rank == 0:
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        print(f"Saving .png samples at {sample_folder_dir}")
+        os.makedirs(args.sample_dir, exist_ok=True)
+        print(f"Will create NPZ file at {sample_folder_dir}.npz")
     dist.barrier()
 
     iterations = int(samples_needed_this_gpu // args.per_proc_batch_size)
@@ -87,9 +100,9 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
 
     global_batch_size = args.per_proc_batch_size * dist.get_world_size()
     
-    # Store all generated indices and metadata for batch decoding
+    # Store all generated indices and decoded samples in memory
     all_indices = []
-    all_sample_indices = []
+    all_samples_memory = []
     
     cur_iter = 0
     for _ in pbar:
@@ -109,13 +122,6 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         # Store indices for batch decoding later
         all_indices.append(indices)
         
-        # Store sample indices for proper file naming
-        batch_sample_indices = []
-        for i in range(args.per_proc_batch_size):
-            index = i * dist.get_world_size() + rank + total
-            batch_sample_indices.append(index)
-        all_sample_indices.extend(batch_sample_indices)
-        
         total += global_batch_size
         cur_iter += 1
         # I use this line to look at the initial images to check the correctness
@@ -127,26 +133,63 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     if rank == 0:
         print("Generation complete. Starting batch decoding...")
     
-    # Decode and save samples in batches of the same size as generation
-    sample_idx = 0
+    # Decode and store samples in memory in batches of the same size as generation
     for batch_idx, indices_batch in enumerate(all_indices):
         # Decode this batch
         samples_batch = tokenizer.decode_codes_to_img(indices_batch, args.image_size_eval)
         
-        # Save samples from this batch
-        for i, sample in enumerate(samples_batch):
-            sample_index = all_sample_indices[sample_idx]
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{sample_index:06d}.png")
-            sample_idx += 1
+        # Store samples in CPU memory as numpy arrays
+        for sample in samples_batch:
+            # Ensure sample is on CPU as numpy array
+            if isinstance(sample, torch.Tensor):
+                sample = sample.cpu().numpy()
+            all_samples_memory.append(sample)
     
     if rank == 0:
-        print("Decoding complete. All samples saved.")
+        print("Decoding complete. Samples stored in memory.")
 
-        # Make sure all processes have finished saving their samples before attempting to convert to .npz
+    # Gather all samples from all processes
     dist.barrier()
+    
+    # Gather samples from all processes to rank 0 using CPU memory
     if rank == 0:
-        sample_path = create_npz_from_sample_folder(sample_folder_dir, total_samples)
+        print("Gathering samples from all processes to host memory...")
+        all_samples_gathered = all_samples_memory.copy()
+        
+        for other_rank in range(1, dist.get_world_size()):
+            # Receive samples from other ranks
+            samples_from_rank = [None] * samples_needed_this_gpu
+            for i in range(samples_needed_this_gpu):
+                # Use CPU tensors for communication
+                tensor_shape = torch.tensor([0, 0, 0], dtype=torch.int32, device='cpu')
+                dist.recv(tensor_shape, src=other_rank)
+                h, w, c = tensor_shape.tolist()
+                
+                # Create CPU tensor for receiving sample data
+                sample_tensor = torch.zeros((h, w, c), dtype=torch.uint8, device='cpu')
+                dist.recv(sample_tensor, src=other_rank)
+                samples_from_rank[i] = sample_tensor.numpy()
+            
+            all_samples_gathered.extend(samples_from_rank)
+        
+        # Create NPZ directly from host memory
+        npz_path = f"{sample_folder_dir}.npz"
+        sample_path = create_npz_from_samples_memory(all_samples_gathered, npz_path, total_samples)
         print("Done.")
+    else:
+        # Send samples to rank 0 using CPU tensors
+        for sample in all_samples_memory:
+            # Send shape first using CPU tensor
+            h, w, c = sample.shape
+            shape_tensor = torch.tensor([h, w, c], dtype=torch.int32, device='cpu')
+            dist.send(shape_tensor, dst=0)
+            
+            # Send sample data using CPU tensor
+            sample_tensor = torch.from_numpy(sample).contiguous().to('cpu')
+            dist.send(sample_tensor, dst=0)
+        
+        sample_path = None
+    
     dist.barrier()
     dist.destroy_process_group()
 
