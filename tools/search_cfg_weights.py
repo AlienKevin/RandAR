@@ -87,6 +87,10 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
 
     global_batch_size = args.per_proc_batch_size * dist.get_world_size()
     
+    # Store all generated indices and metadata for batch decoding
+    all_indices = []
+    all_sample_indices = []
+    
     cur_iter = 0
     for _ in pbar:
         c_indices = torch.randint(0, args.num_classes, (args.per_proc_batch_size,), device=device)
@@ -102,17 +106,41 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
             top_p=args.top_p,
         )
 
-        samples = tokenizer.decode_codes_to_img(indices, args.image_size_eval)
-    
-        for i, sample in enumerate(samples):
+        # Store indices for batch decoding later
+        all_indices.append(indices)
+        
+        # Store sample indices for proper file naming
+        batch_sample_indices = []
+        for i in range(args.per_proc_batch_size):
             index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
+            batch_sample_indices.append(index)
+        all_sample_indices.extend(batch_sample_indices)
+        
         total += global_batch_size
         cur_iter += 1
         # I use this line to look at the initial images to check the correctness
         # comment this out if you want to generate more
         if args.debug:
             import pdb; pdb.set_trace()
+    
+    # Batch decode all generated indices using same batch size
+    if rank == 0:
+        print("Generation complete. Starting batch decoding...")
+    
+    # Decode and save samples in batches of the same size as generation
+    sample_idx = 0
+    for batch_idx, indices_batch in enumerate(all_indices):
+        # Decode this batch
+        samples_batch = tokenizer.decode_codes_to_img(indices_batch, args.image_size_eval)
+        
+        # Save samples from this batch
+        for i, sample in enumerate(samples_batch):
+            sample_index = all_sample_indices[sample_idx]
+            Image.fromarray(sample).save(f"{sample_folder_dir}/{sample_index:06d}.png")
+            sample_idx += 1
+    
+    if rank == 0:
+        print("Decoding complete. All samples saved.")
 
         # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
