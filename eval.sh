@@ -1,0 +1,14 @@
+torchrun tools/search_cfg_weights.py \
+    --config configs/randar/randar_l_0.3b_llamagen.yaml \
+    --exp-name randar_0.3b_360k_llamagen \
+    --gpt-ckpt temp/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors \
+    --vq-ckpt temp/vq_ds16_c2i.pt \
+    --per-proc-batch-size 128 \
+    --num-fid-samples-search 10000 \
+    --num-fid-samples-report 5000 \
+    --cfg-scales-interval 0.2 \
+    --cfg-scales-search 3.4,3.4 \
+    --results-path ./results \
+    --ref-path temp/VIRTUAL_imagenet256_labeled.npz \
+    --sample-dir temp \
+    --num-inference-steps 88

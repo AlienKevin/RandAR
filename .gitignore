@@ -4,12 +4,9 @@ wandb/*
 logs/*
 samples/*
 slurm_logs/*
+temp/*
 
-checkpoints/
-results/
-
-checkpoints
-results
+.specstory/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

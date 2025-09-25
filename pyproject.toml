@@ -1,0 +1,14 @@
+[project]
+name = "RandAR"
+version = "1.0.0"
+readme = "README.md"
+
+dependencies = [
+    "torch>=2.1",
+    "accelerate==0.31.0",
+    "einops",
+    "omegaconf",
+    "wandb",
+    "tensorflow",
+    "scipy",
+]
