@@ -186,34 +186,41 @@ def main(args):
 
     # CFG scales to be searched
     eval_results = {}
-    cfg_scales_search = args.cfg_scales_search.split(",")
-    cfg_scales_search = [float(cfg_scale) for cfg_scale in cfg_scales_search]
-    cfg_scales_interval = float(args.cfg_scales_interval)
-    cfg_scales_list = np.arange(cfg_scales_search[0], cfg_scales_search[1] + 1e-4, cfg_scales_interval)
-    print(f"CFG scales to be searched: {cfg_scales_list}")
-
+    
     result_file_name = (f"{args.results_path}/{args.exp_name}-{ckpt_string_name}-"
                         f"size-{args.image_size}-size-{args.image_size_eval}-search.json")
 
-    # run throught the CFG scales
-    for cfg_scale in cfg_scales_list:
-        fid, sfid, IS, precision, recall = sample_and_eval(
-            tokenizer, gpt_model, cfg_scale, args, device, total_samples)
-        eval_results[f"{cfg_scale:.2f}"] = {
-            "fid": fid,
-            "sfid": sfid,
-            "IS": IS,
-            "precision": precision,
-            "recall": recall
-        }
-        print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
+    # Skip search phase if cfg_optimal_scale is provided
+    if args.cfg_optimal_scale is not None:
+        optimal_cfg_scale = args.cfg_optimal_scale
+        print(f"Using provided optimal CFG scale: {optimal_cfg_scale:.2f}")
+    else:
+        cfg_scales_search = args.cfg_scales_search.split(",")
+        cfg_scales_search = [float(cfg_scale) for cfg_scale in cfg_scales_search]
+        cfg_scales_interval = float(args.cfg_scales_interval)
+        cfg_scales_list = np.arange(cfg_scales_search[0], cfg_scales_search[1] + 1e-4, cfg_scales_interval)
+        print(f"CFG scales to be searched: {cfg_scales_list}")
 
-        with open(result_file_name, "w") as f:
-            json.dump(eval_results, f)
-    
+        # run throught the CFG scales
+        for cfg_scale in cfg_scales_list:
+            fid, sfid, IS, precision, recall = sample_and_eval(
+                tokenizer, gpt_model, cfg_scale, args, device, total_samples)
+            eval_results[f"{cfg_scale:.2f}"] = {
+                "fid": fid,
+                "sfid": sfid,
+                "IS": IS,
+                "precision": precision,
+                "recall": recall
+            }
+            print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
+
+            with open(result_file_name, "w") as f:
+                json.dump(eval_results, f)
+        
+        optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
+
     # report the results
     total_samples = int(math.ceil(args.num_fid_samples_report / global_batch_size) * global_batch_size)
-    optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
     fid, sfid, IS, precision, recall = sample_and_eval(
         tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples)
     
@@ -248,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scales-search", type=str, default="2.0, 8.0")
     parser.add_argument("--cfg-scales-interval", type=float, default=0.2)
+    parser.add_argument("--cfg-optimal-scale", type=float, default=None, help="If specified, skip search phase and use this CFG scale directly")
     parser.add_argument("--sample-dir", type=str, default="/tmp")
     parser.add_argument("--num-inference-steps", type=int, default=88)
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
