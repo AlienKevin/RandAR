@@ -44,10 +44,11 @@ for num_steps in 1 2 4 8 16 32 64 128 256; do
         --results-path ./results \
         --ref-path temp/VIRTUAL_imagenet256_labeled.npz \
         --sample-dir "$sample_dir" \
+        --clean-samples \
         --num-inference-steps $num_steps \
-        --cfg-scales-interval 0.2 \
-        --cfg-scales-search 2.0,8.0; then
-        # --cfg-optimal-scale 3.4
+        --cfg-optimal-scale 3.4; then
+        # --cfg-scales-interval 0.2 \
+        # --cfg-scales-search 2.0,8.0
         
         log_with_timestamp "✓ SUCCESS: Completed evaluation with num-inference-steps: $num_steps"
         successful_runs+=($num_steps)
