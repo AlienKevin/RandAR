@@ -24,6 +24,6 @@ wget https://huggingface.co/ziqipang/RandAR/resolve/main/randar_0.3b_llamagen_36
 
 # Download ImageNet reference batch
 echo "Downloading ImageNet reference batch..."
-wget https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz -O temp/VIRTUAL_imagenet256_labeled.npz
+wget https://huggingface.co/AlienKevin/adm_evals/resolve/main/VIRTUAL_imagenet256_labeled.npz -O temp/VIRTUAL_imagenet256_labeled.npz
 
 echo "Setup complete!"
