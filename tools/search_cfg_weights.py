@@ -66,6 +66,7 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
+    torch.cuda.empty_cache()
 
     if rank == 0:
         print(f"Total number of images that will be sampled: {total_samples}")
