@@ -264,6 +264,10 @@ def main(args):
     result_file_name = (f"{args.results_path}/{args.exp_name}-{ckpt_string_name}-"
                         f"size-{args.image_size}-size-{args.image_size_eval}-search.json")
 
+    # Create results directory if it doesn't exist
+    if dist.get_rank() == 0:
+        os.makedirs(os.path.dirname(result_file_name), exist_ok=True)
+
     # Skip search phase if cfg_optimal_scale is provided
     if args.cfg_optimal_scale is not None:
         optimal_cfg_scale = args.cfg_optimal_scale
