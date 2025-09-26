@@ -1,6 +1,13 @@
 #!/bin/bash
 
 # RandAR Setup Script
+
+# setup uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+uv sync
+source .venv/bin/activate
+
 # Downloads required model weights and reference data
 
 echo "Starting RandAR setup..."
