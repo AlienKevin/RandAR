@@ -1,5 +1,9 @@
 """ Search for the optimal cfg weights for the given model.
     First using 10k samples to find the optimal value, then run on 50k samples to report.
+    
+    Options:
+    - Use --clean-samples to delete NPZ files after evaluation (saves disk space)
+    - Use --visualize-samples to create 10x10 grids of sample images from specific classes
 """
 # Modified from:
 #   LLaMAGen: https://github.com/FoundationVision/LlamaGen/blob/main/autoregressive/sample/sample_c2i_ddp.py
@@ -14,7 +18,7 @@ from omegaconf import OmegaConf
 import json
 from tqdm import tqdm
 import os
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import math
 import argparse
@@ -55,6 +59,143 @@ def create_npz_from_samples_memory(samples_list, npz_path, total_samples):
         np.savez(npz_path, arr_0=samples)
         print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
     return npz_path
+
+
+def create_visualization_grid(tokenizer, gpt_model, args, device, class_indices, cfg_scale, samples_per_class=10):
+    """
+    Create a visualization grid with samples from specific classes.
+    
+    Args:
+        tokenizer: The tokenizer model
+        gpt_model: The GPT model
+        args: Command line arguments
+        device: GPU device
+        class_indices: List of class indices to visualize
+        cfg_scale: CFG scale to use for sampling
+        samples_per_class: Number of samples per class (default 10)
+    
+    Returns:
+        PIL Image of the grid
+    """
+    rank = dist.get_rank()
+    
+    if rank != 0:
+        return None  # Only rank 0 creates visualization
+    
+    print(f"Creating visualization grid for classes: {class_indices}")
+    
+    # Save current random state to restore later
+    current_rng_state = torch.get_rng_state()
+    
+    all_samples = []
+    
+    # Generate samples for each class with fixed seeds for reproducibility
+    for idx, class_idx in enumerate(class_indices):
+        # Set fixed seed for this class to ensure reproducible visualizations
+        # Use a deterministic seed based on class index and global seed
+        vis_seed = args.global_seed + (idx * 1000) + class_idx
+        torch.manual_seed(vis_seed)
+        
+        print(f"Generating {samples_per_class} samples for class {class_idx} (seed: {vis_seed})")
+        
+        # Create batch of class indices
+        c_indices = torch.full((samples_per_class,), class_idx, device=device)
+        cfg_scales = (1.0, cfg_scale)
+        
+        # Generate indices
+        indices = gpt_model.generate(
+            cond=c_indices,
+            token_order=None,
+            cfg_scales=cfg_scales,
+            num_inference_steps=args.num_inference_steps,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+        )
+        
+        # Decode to images
+        samples = tokenizer.decode_codes_to_img(indices, args.image_size_eval)
+        
+        # Convert to numpy arrays and collect
+        class_samples = []
+        for sample in samples:
+            if isinstance(sample, torch.Tensor):
+                sample = sample.cpu().numpy()
+            class_samples.append(sample)
+        
+        all_samples.extend(class_samples)
+    
+    # Create grid
+    grid_size = len(class_indices)  # 10x10 for 10 classes
+    image_size = args.image_size_eval
+    
+    # Create the grid image
+    grid_image = Image.new('RGB', (grid_size * image_size, grid_size * image_size), color='white')
+    
+    # Place images in grid
+    for i, sample in enumerate(all_samples):
+        row = i // samples_per_class
+        col = i % samples_per_class
+        
+        # Convert numpy array to PIL Image
+        if sample.dtype != np.uint8:
+            sample = (sample * 255).astype(np.uint8)
+        
+        sample_img = Image.fromarray(sample)
+        
+        # Paste into grid
+        x = col * image_size
+        y = row * image_size
+        grid_image.paste(sample_img, (x, y))
+    
+    # Restore original random state to not affect main sampling
+    torch.set_rng_state(current_rng_state)
+    
+    return grid_image
+
+
+def save_visualization_grid(tokenizer, gpt_model, args, device, folder_name, cfg_scale):
+    """
+    Generate and save visualization grid if visualization classes are specified.
+    
+    Args:
+        tokenizer: The tokenizer model
+        gpt_model: The GPT model  
+        args: Command line arguments
+        device: GPU device
+        folder_name: Base folder name for saving
+        cfg_scale: CFG scale used for sampling
+    """
+    if not hasattr(args, 'visualize_samples') or not args.visualize_samples:
+        return
+    
+    if dist.get_rank() != 0:
+        return  # Only rank 0 handles visualization
+    
+    try:
+        print("Generating visualization grid...")
+        
+        # Create visualization grid
+        grid_image = create_visualization_grid(
+            tokenizer=tokenizer,
+            gpt_model=gpt_model,
+            args=args,
+            device=device,
+            class_indices=args.visualize_samples,
+            cfg_scale=cfg_scale,
+            samples_per_class=10
+        )
+        
+        if grid_image:
+            # Create visualization filename
+            vis_filename = f"{args.sample_dir}/{folder_name}.png"
+            
+            # Save the grid
+            grid_image.save(vis_filename)
+            print(f"Saved visualization grid to: {vis_filename}")
+            
+    except Exception as e:
+        print(f"Warning: Failed to create visualization grid: {e}")
 
 
 def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
@@ -192,9 +333,20 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     
     dist.barrier()
 
+    # Create visualization grid if requested (before FID computation)
+    save_visualization_grid(tokenizer, gpt_model, args, device, folder_name, cfg_scale)
+    
     # Only rank 0 should compute FID since it has the complete sample data
     if dist.get_rank() == 0:
         fid, sfid, IS, precision, recall = compute_fid(args.ref_path, sample_path)
+        
+        # Clean up sample file if requested
+        if sample_path and getattr(args, 'clean_samples', False):
+            try:
+                os.remove(sample_path)
+                print(f"Cleaned up sample file: {sample_path}")
+            except Exception as e:
+                print(f"Warning: Failed to clean up sample file {sample_path}: {e}")
     else:
         # Other ranks return dummy values
         fid, sfid, IS, precision, recall = 0.0, 0.0, 0.0, 0.0, 0.0
@@ -365,5 +517,11 @@ if __name__ == "__main__":
     parser.add_argument("--ref-path", type=str, default="/tmp/VIRTUAL_imagenet256_labeled.npz")
     # output results
     parser.add_argument("--results-path", type=str, default="./results")
+    # cleanup options
+    parser.add_argument("--clean-samples", action="store_true", default=False, help="Delete sample NPZ files after evaluation")
+    # visualization options
+    parser.add_argument("--visualize-samples", type=int, nargs="*", 
+                       default=[555, 812, 207, 417, 487, 416, 981, 537, 0, 801],
+                       help="Class indices to visualize in a 10x10 grid (10 samples per class). Default: fire engine, space shuttle, golden retriever, hot air balloon, cell phone, balance beam, baseball player, dog sled, tench, snorkel")
     args = parser.parse_args()
     main(args)
