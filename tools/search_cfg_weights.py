@@ -58,8 +58,7 @@ def create_npz_from_samples_memory(samples_list, npz_path, total_samples):
 
 
 def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
-    # Setup DDP:
-    dist.init_process_group("nccl")
+    # Use existing DDP setup from main():
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
@@ -191,9 +190,14 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
         sample_path = None
     
     dist.barrier()
-    dist.destroy_process_group()
 
-    fid, sfid, IS, precision, recall = compute_fid(args.ref_path, sample_path)
+    # Only rank 0 should compute FID since it has the complete sample data
+    if dist.get_rank() == 0:
+        fid, sfid, IS, precision, recall = compute_fid(args.ref_path, sample_path)
+    else:
+        # Other ranks return dummy values
+        fid, sfid, IS, precision, recall = 0.0, 0.0, 0.0, 0.0, 0.0
+    
     return fid, sfid, IS, precision, recall
 
 
@@ -205,7 +209,7 @@ def main(args):
     torch.set_grad_enabled(False)
 
     # Setup DDP:
-    dist.init_process_group("nccl")
+    dist.init_process_group("gloo")
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
@@ -250,7 +254,6 @@ def main(args):
     global_batch_size = n * dist.get_world_size()
 
     dist.barrier()
-    dist.destroy_process_group()
     
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples_search / global_batch_size) * global_batch_size)
@@ -276,37 +279,54 @@ def main(args):
         for cfg_scale in cfg_scales_list:
             fid, sfid, IS, precision, recall = sample_and_eval(
                 tokenizer, gpt_model, cfg_scale, args, device, total_samples)
-            eval_results[f"{cfg_scale:.2f}"] = {
-                "fid": fid,
-                "sfid": sfid,
-                "IS": IS,
-                "precision": precision,
-                "recall": recall
-            }
-            print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
+            
+            # Only rank 0 processes results and saves to file
+            if dist.get_rank() == 0:
+                eval_results[f"{cfg_scale:.2f}"] = {
+                    "fid": fid,
+                    "sfid": sfid,
+                    "IS": IS,
+                    "precision": precision,
+                    "recall": recall
+                }
+                print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
 
-            with open(result_file_name, "w") as f:
-                json.dump(eval_results, f)
+                with open(result_file_name, "w") as f:
+                    json.dump(eval_results, f)
         
-        optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
+        # Only rank 0 determines optimal CFG scale
+        if dist.get_rank() == 0:
+            optimal_cfg_scale = float(min(eval_results, key=lambda x: eval_results[x]["fid"]))
+        else:
+            optimal_cfg_scale = 0.0  # Dummy value for non-rank-0 processes
+        
+        # Broadcast optimal CFG scale to all ranks
+        optimal_cfg_tensor = torch.tensor([optimal_cfg_scale], dtype=torch.float32, device=device)
+        dist.broadcast(optimal_cfg_tensor, src=0)
+        optimal_cfg_scale = optimal_cfg_tensor.item()
 
     # report the results
     total_samples = int(math.ceil(args.num_fid_samples_report / global_batch_size) * global_batch_size)
     fid, sfid, IS, precision, recall = sample_and_eval(
         tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples)
     
-    print(f"Optimal CFG scale: {optimal_cfg_scale:.2f}")
-    print(f"Eval results for optimal CFG scale: {fid, sfid, IS, precision, recall}")
-    eval_results[f"{optimal_cfg_scale:.2f}-report"] = {
-        "fid": fid,
-        "sfid": sfid,
-        "IS": IS,
-        "precision": precision,
-        "recall": recall
-    }
+    # Only rank 0 handles final reporting and file saving
+    if dist.get_rank() == 0:
+        print(f"Optimal CFG scale: {optimal_cfg_scale:.2f}")
+        print(f"Eval results for optimal CFG scale: {fid, sfid, IS, precision, recall}")
+        eval_results[f"{optimal_cfg_scale:.2f}-report"] = {
+            "fid": fid,
+            "sfid": sfid,
+            "IS": IS,
+            "precision": precision,
+            "recall": recall
+        }
 
-    with open(result_file_name, "w") as f:
-        json.dump(eval_results, f)
+        with open(result_file_name, "w") as f:
+            json.dump(eval_results, f)
+    
+    # Clean up distributed process group
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
