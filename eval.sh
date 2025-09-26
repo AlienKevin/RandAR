@@ -24,6 +24,14 @@ create_sample_dir() {
 
 log_with_timestamp "Starting evaluation sweep across num-inference-steps: 1 2 4 8 16 32 64 128 256"
 
+# size_name="l"
+# size_b="0.3b"
+# optimal_cfg=3.4
+
+size_name="xl"
+size_b="0.7b"
+optimal_cfg=4.0
+
 # Sweep over different num-inference-steps values
 for num_steps in 1 2 4 8 16 32 64 128 256; do
     log_with_timestamp "Starting evaluation with num-inference-steps: $num_steps"
@@ -34,9 +42,9 @@ for num_steps in 1 2 4 8 16 32 64 128 256; do
     
     # Run torchrun with error handling
     if torchrun --nproc-per-node=auto tools/search_cfg_weights.py \
-        --config configs/randar/randar_l_0.3b_llamagen.yaml \
-        --exp-name "randar_0.3b_360k_llamagen_${num_steps}" \
-        --gpt-ckpt temp/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors \
+        --config configs/randar/randar_${size_name}_${size_b}_llamagen.yaml \
+        --exp-name "randar_${size_b}_360k_llamagen_${num_steps}" \
+        --gpt-ckpt temp/randar_${size_b}_llamagen_360k_bs_1024_lr_0.0004.safetensors \
         --vq-ckpt temp/vq_ds16_c2i.pt \
         --per-proc-batch-size 128 \
         --num-fid-samples-search 10000 \
@@ -46,7 +54,7 @@ for num_steps in 1 2 4 8 16 32 64 128 256; do
         --sample-dir "$sample_dir" \
         --clean-samples \
         --num-inference-steps $num_steps \
-        --cfg-optimal-scale 3.4; then
+        --cfg-optimal-scale $optimal_cfg; then
         # --cfg-scales-interval 0.2 \
         # --cfg-scales-search 2.0,8.0
         

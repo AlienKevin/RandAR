@@ -21,6 +21,8 @@ wget https://huggingface.co/FoundationVision/LlamaGen/resolve/main/vq_ds16_c2i.p
 # Download RandAR model weights
 echo "Downloading RandAR model weights..."
 wget https://huggingface.co/ziqipang/RandAR/resolve/main/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors -O temp/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors
+wget https://huggingface.co/ziqipang/RandAR/resolve/main/randar_0.7b_llamagen_360k_bs_1024_lr_0.0004.safetensors -O temp/randar_0.7b_llamagen_360k_bs_1024_lr_0.0004.safetensors
+
 
 # Download ImageNet reference batch
 echo "Downloading ImageNet reference batch..."
