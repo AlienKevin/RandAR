@@ -1,5 +1,10 @@
 """ Search for the optimal cfg weights for the given model.
     First using 10k samples to find the optimal value, then run on 50k samples to report.
+    
+    GCS Support:
+    - Set --sample-dir to a GCS path (e.g., gs://my-bucket/samples/) to upload NPZ files to GCS
+    - Use --gcs-project-id to specify a specific GCS project (optional)
+      - When set with GCS sample-dir, also uploads results JSON to the same bucket at {bucket}/{results-path}/
 """
 # Modified from:
 #   LLaMAGen: https://github.com/FoundationVision/LlamaGen/blob/main/autoregressive/sample/sample_c2i_ddp.py
@@ -19,6 +24,15 @@ import numpy as np
 import math
 import argparse
 import sys
+import threading
+import queue
+import time
+try:
+    from google.cloud import storage
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
+    print("Warning: google-cloud-storage not available. GCS functionality will be disabled.")
 sys.path.append("./")
 from RandAR.dataset.builder import build_dataset
 from RandAR.utils.distributed import init_distributed_mode, is_main_process
@@ -57,7 +71,273 @@ def create_npz_from_samples_memory(samples_list, npz_path, total_samples):
     return npz_path
 
 
-def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples):
+def init_gcs_client(gcs_project_id=None):
+    """
+    Initialize Google Cloud Storage client.
+    """
+    if not GCS_AVAILABLE:
+        raise ImportError("google-cloud-storage is not available. Please install it with: pip install google-cloud-storage")
+    
+    if gcs_project_id:
+        client = storage.Client(project=gcs_project_id)
+    else:
+        # Use default credentials and project
+        client = storage.Client()
+    return client
+
+
+def upload_to_gcs(local_path, gcs_bucket_name, gcs_blob_name, gcs_project_id=None):
+    """
+    Upload a file to Google Cloud Storage.
+    
+    Args:
+        local_path: Local file path to upload
+        gcs_bucket_name: GCS bucket name
+        gcs_blob_name: GCS blob (object) name
+        gcs_project_id: Optional GCS project ID
+    
+    Returns:
+        GCS URI of the uploaded file
+    """
+    if not GCS_AVAILABLE:
+        raise ImportError("google-cloud-storage is not available. Please install it with: pip install google-cloud-storage")
+    
+    client = init_gcs_client(gcs_project_id)
+    bucket = client.bucket(gcs_bucket_name)
+    blob = bucket.blob(gcs_blob_name)
+    
+    print(f"Uploading {local_path} to gs://{gcs_bucket_name}/{gcs_blob_name}")
+    blob.upload_from_filename(local_path)
+    gcs_uri = f"gs://{gcs_bucket_name}/{gcs_blob_name}"
+    print(f"Successfully uploaded to {gcs_uri}")
+    
+    return gcs_uri
+
+
+def is_gcs_path(path):
+    """
+    Check if a path is a GCS path (starts with gs://).
+    """
+    return path.startswith("gs://")
+
+
+def parse_gcs_path(gcs_path):
+    """
+    Parse a GCS path to extract bucket name and blob name.
+    
+    Args:
+        gcs_path: GCS path like "gs://bucket-name/path/to/file"
+    
+    Returns:
+        tuple: (bucket_name, blob_name)
+    """
+    if not gcs_path.startswith("gs://"):
+        raise ValueError(f"Invalid GCS path: {gcs_path}. Must start with 'gs://'")
+    
+    path_without_prefix = gcs_path[5:]  # Remove "gs://"
+    parts = path_without_prefix.split("/", 1)
+    
+    if len(parts) < 2:
+        raise ValueError(f"Invalid GCS path: {gcs_path}. Must include bucket and object name")
+    
+    bucket_name = parts[0]
+    blob_name = parts[1]
+    
+    return bucket_name, blob_name
+
+
+def upload_results_to_gcs(local_results_path, gcs_bucket_name, results_path, gcs_project_id=None):
+    """
+    Upload results JSON file to GCS bucket with the same directory structure.
+    
+    Args:
+        local_results_path: Local path to the results JSON file
+        gcs_bucket_name: GCS bucket name (extracted from sample_dir)
+        results_path: Original results_path argument (e.g., "./results")
+        gcs_project_id: Optional GCS project ID
+    
+    Returns:
+        GCS URI of the uploaded results file
+    """
+    if not GCS_AVAILABLE:
+        raise ImportError("google-cloud-storage is not available. Please install it with: pip install google-cloud-storage")
+    
+    # Get the relative path from the results directory
+    results_filename = os.path.basename(local_results_path)
+    
+    # Clean up the results_path (remove leading ./ if present)
+    clean_results_path = results_path.lstrip("./")
+    
+    # Create the GCS blob name: results_path/filename
+    gcs_blob_name = f"{clean_results_path}/{results_filename}"
+    
+    # Upload the file
+    client = init_gcs_client(gcs_project_id)
+    bucket = client.bucket(gcs_bucket_name)
+    blob = bucket.blob(gcs_blob_name)
+    
+    print(f"Uploading results to gs://{gcs_bucket_name}/{gcs_blob_name}")
+    blob.upload_from_filename(local_results_path)
+    gcs_uri = f"gs://{gcs_bucket_name}/{gcs_blob_name}"
+    print(f"Successfully uploaded results to {gcs_uri}")
+    
+    return gcs_uri
+
+
+class GCSUploadManager:
+    """
+    Manager for handling background GCS uploads using threading.
+    """
+    def __init__(self, gcs_project_id=None):
+        self.gcs_project_id = gcs_project_id
+        self.upload_queue = queue.Queue()
+        self.upload_threads = []
+        self.upload_results = {}  # Track upload results
+        self.active_uploads = 0
+        self.lock = threading.Lock()
+        self.max_workers = 4  # Number of concurrent upload threads
+        
+    def _upload_worker(self):
+        """Worker function for upload threads."""
+        while True:
+            try:
+                task = self.upload_queue.get(timeout=1)
+                if task is None:  # Shutdown signal
+                    break
+                    
+                upload_type, file_path, gcs_bucket_name, blob_name = task
+                
+                with self.lock:
+                    self.active_uploads += 1
+                
+                try:
+                    if upload_type == "npz":
+                        gcs_uri = upload_to_gcs(
+                            local_path=file_path,
+                            gcs_bucket_name=gcs_bucket_name,
+                            gcs_blob_name=blob_name,
+                            gcs_project_id=self.gcs_project_id
+                        )
+                    elif upload_type == "results":
+                        gcs_uri = upload_to_gcs(
+                            local_path=file_path,
+                            gcs_bucket_name=gcs_bucket_name,
+                            gcs_blob_name=blob_name,
+                            gcs_project_id=self.gcs_project_id
+                        )
+                    
+                    with self.lock:
+                        self.upload_results[file_path] = {"success": True, "gcs_uri": gcs_uri}
+                        
+                except Exception as e:
+                    with self.lock:
+                        self.upload_results[file_path] = {"success": False, "error": str(e)}
+                        print(f"Background upload failed for {file_path}: {e}")
+                
+                finally:
+                    with self.lock:
+                        self.active_uploads -= 1
+                    self.upload_queue.task_done()
+                    
+            except queue.Empty:
+                continue
+                
+    def start_workers(self):
+        """Start the upload worker threads."""
+        for _ in range(self.max_workers):
+            thread = threading.Thread(target=self._upload_worker, daemon=True)
+            thread.start()
+            self.upload_threads.append(thread)
+    
+    def queue_npz_upload(self, local_path, gcs_bucket_name, blob_name):
+        """Queue an NPZ file for background upload."""
+        self.upload_queue.put(("npz", local_path, gcs_bucket_name, blob_name))
+        print(f"Queued NPZ upload: {local_path} -> gs://{gcs_bucket_name}/{blob_name}")
+    
+    def queue_results_upload(self, local_path, gcs_bucket_name, blob_name):
+        """Queue a results file for background upload."""
+        self.upload_queue.put(("results", local_path, gcs_bucket_name, blob_name))
+        print(f"Queued results upload: {local_path} -> gs://{gcs_bucket_name}/{blob_name}")
+    
+    def wait_for_all_uploads(self, timeout=3600):
+        """Wait for all uploads to complete."""
+        print("Waiting for all GCS uploads to complete...")
+        start_time = time.time()
+        
+        while True:
+            with self.lock:
+                queue_size = self.upload_queue.qsize()
+                active = self.active_uploads
+            
+            if queue_size == 0 and active == 0:
+                print("All GCS uploads completed!")
+                break
+                
+            if time.time() - start_time > timeout:
+                print(f"Warning: Upload timeout after {timeout}s. Some uploads may not have completed.")
+                break
+                
+            print(f"Uploads in progress: {active} active, {queue_size} queued")
+            time.sleep(5)
+    
+    def shutdown(self):
+        """Shutdown the upload manager."""
+        # Signal workers to stop
+        for _ in range(len(self.upload_threads)):
+            self.upload_queue.put(None)
+        
+        # Wait for threads to finish
+        for thread in self.upload_threads:
+            thread.join(timeout=10)
+    
+    def get_upload_summary(self):
+        """Get a summary of upload results."""
+        with self.lock:
+            total = len(self.upload_results)
+            successful = sum(1 for result in self.upload_results.values() if result["success"])
+            failed = total - successful
+            return {"total": total, "successful": successful, "failed": failed}
+
+
+def save_results_with_gcs_upload(eval_results, result_file_name, args, gcs_manager=None):
+    """
+    Save results JSON file locally and optionally upload to GCS.
+    
+    Args:
+        eval_results: Dictionary of evaluation results
+        result_file_name: Local path for the results file
+        args: Command line arguments
+        gcs_manager: Optional GCSUploadManager for background uploads
+    """
+    # Save results locally
+    with open(result_file_name, "w") as f:
+        json.dump(eval_results, f)
+    
+    # Upload to GCS if project ID is specified
+    if args.gcs_project_id:
+        # Check if we have a GCS sample directory to extract bucket from
+        original_sample_dir = getattr(args, '_original_sample_dir', args.sample_dir)
+        if is_gcs_path(original_sample_dir):
+            try:
+                # Extract bucket name from the original sample directory
+                gcs_bucket_name, gcs_base_path = parse_gcs_path(original_sample_dir)
+                
+                # Create blob name for results
+                results_filename = os.path.basename(result_file_name)
+                clean_results_path = args.results_path.lstrip("./")
+                blob_name = f"{clean_results_path}/{results_filename}"
+                
+                # Queue for background upload
+                gcs_manager.queue_results_upload(result_file_name, gcs_bucket_name, blob_name)
+            except Exception as e:
+                print(f"Warning: Failed to queue results upload to GCS: {e}")
+                print("Results saved locally only.")
+        else:
+            print("Note: gcs-project-id specified but sample-dir is not a GCS path.")
+            print("To upload results to GCS, specify a GCS path for --sample-dir (e.g., gs://my-bucket/samples/)")
+
+
+def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples, gcs_manager=None):
     # Use existing DDP setup from main():
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
@@ -192,6 +472,25 @@ def sample_and_eval(tokenizer, gpt_model, cfg_scale, args, device, total_samples
     
     dist.barrier()
 
+    # Handle GCS upload if original sample_dir is a GCS path
+    original_sample_dir = getattr(args, '_original_sample_dir', args.sample_dir)
+    if dist.get_rank() == 0 and sample_path and is_gcs_path(original_sample_dir):
+        try:
+            # Parse the original GCS path to get bucket and determine the blob name
+            gcs_bucket_name, gcs_base_path = parse_gcs_path(original_sample_dir)
+            
+            # Create the blob name from the folder structure
+            blob_name = f"{gcs_base_path.rstrip('/')}/{folder_name}.npz"
+            
+            
+            # Queue for background upload
+            gcs_manager.queue_npz_upload(sample_path, gcs_bucket_name, blob_name)
+            print(f"NPZ file will be uploaded to: gs://{gcs_bucket_name}/{blob_name}")
+            
+        except Exception as e:
+            print(f"Warning: Failed to queue/upload to GCS: {e}")
+            print("Continuing with local file...")
+
     # Only rank 0 should compute FID since it has the complete sample data
     if dist.get_rank() == 0:
         fid, sfid, IS, precision, recall = compute_fid(args.ref_path, sample_path)
@@ -247,14 +546,53 @@ def main(args):
     )
     args.ckpt_string_name = ckpt_string_name
 
+    # Validate GCS configuration and create local sample directory
     if rank == 0:
-        os.makedirs(args.sample_dir, exist_ok=True)
+        if is_gcs_path(args.sample_dir):
+            if not GCS_AVAILABLE:
+                raise ImportError("GCS path specified but google-cloud-storage is not available. Please install it with: pip install google-cloud-storage")
+            
+            # Validate GCS path format
+            try:
+                bucket_name, base_path = parse_gcs_path(args.sample_dir)
+                print(f"GCS configuration: bucket={bucket_name}, base_path={base_path}")
+                
+                # Test GCS connectivity
+                client = init_gcs_client(args.gcs_project_id)
+                bucket = client.bucket(bucket_name)
+                if not bucket.exists():
+                    print(f"Warning: GCS bucket '{bucket_name}' may not exist or is not accessible")
+                else:
+                    print(f"Successfully connected to GCS bucket: {bucket_name}")
+                    
+            except Exception as e:
+                raise ValueError(f"Invalid GCS configuration: {e}")
+            
+            # Create a local temporary directory for NPZ files before uploading
+            local_sample_dir = "/tmp/randar_samples"
+            os.makedirs(local_sample_dir, exist_ok=True)
+            print(f"Using local temporary directory: {local_sample_dir}")
+            # Store original GCS path for later use
+            args._original_sample_dir = args.sample_dir
+            args.sample_dir = local_sample_dir
+        else:
+            # Regular local directory
+            os.makedirs(args.sample_dir, exist_ok=True)
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
     global_batch_size = n * dist.get_world_size()
 
     dist.barrier()
+    
+    # Initialize GCS upload manager if needed
+    gcs_manager = None
+    if dist.get_rank() == 0 and args.gcs_project_id:
+        original_sample_dir = getattr(args, '_original_sample_dir', args.sample_dir)
+        if is_gcs_path(original_sample_dir):
+            gcs_manager = GCSUploadManager(gcs_project_id=args.gcs_project_id)
+            gcs_manager.start_workers()
+            print("Started GCS upload manager for background uploads")
     
     # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
     total_samples = int(math.ceil(args.num_fid_samples_search / global_batch_size) * global_batch_size)
@@ -283,7 +621,7 @@ def main(args):
         # run throught the CFG scales
         for cfg_scale in cfg_scales_list:
             fid, sfid, IS, precision, recall = sample_and_eval(
-                tokenizer, gpt_model, cfg_scale, args, device, total_samples)
+                tokenizer, gpt_model, cfg_scale, args, device, total_samples, gcs_manager)
             
             # Only rank 0 processes results and saves to file
             if dist.get_rank() == 0:
@@ -296,8 +634,7 @@ def main(args):
                 }
                 print(f"Eval results for CFG scale {cfg_scale:.2f}: {eval_results[f'{cfg_scale:.2f}']}")
 
-                with open(result_file_name, "w") as f:
-                    json.dump(eval_results, f)
+                save_results_with_gcs_upload(eval_results, result_file_name, args, gcs_manager)
         
         # Only rank 0 determines optimal CFG scale
         if dist.get_rank() == 0:
@@ -313,7 +650,7 @@ def main(args):
     # report the results
     total_samples = int(math.ceil(args.num_fid_samples_report / global_batch_size) * global_batch_size)
     fid, sfid, IS, precision, recall = sample_and_eval(
-        tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples)
+        tokenizer, gpt_model, optimal_cfg_scale, args, device, total_samples, gcs_manager)
     
     # Only rank 0 handles final reporting and file saving
     if dist.get_rank() == 0:
@@ -327,8 +664,14 @@ def main(args):
             "recall": recall
         }
 
-        with open(result_file_name, "w") as f:
-            json.dump(eval_results, f)
+        save_results_with_gcs_upload(eval_results, result_file_name, args, gcs_manager)
+        
+        # Wait for all GCS uploads to complete before finishing
+        if gcs_manager:
+            gcs_manager.wait_for_all_uploads()
+            summary = gcs_manager.get_upload_summary()
+            print(f"GCS Upload Summary: {summary['successful']}/{summary['total']} successful uploads")
+            gcs_manager.shutdown()
     
     # Clean up distributed process group
     dist.destroy_process_group()
@@ -352,7 +695,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scales-search", type=str, default="2.0, 8.0")
     parser.add_argument("--cfg-scales-interval", type=float, default=0.2)
     parser.add_argument("--cfg-optimal-scale", type=float, default=None, help="If specified, skip search phase and use this CFG scale directly")
-    parser.add_argument("--sample-dir", type=str, default="/tmp")
+    parser.add_argument("--sample-dir", type=str, default="temp")
     parser.add_argument("--num-inference-steps", type=int, default=88)
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--num-fid-samples-search", type=int, default=10000)
@@ -365,5 +708,7 @@ if __name__ == "__main__":
     parser.add_argument("--ref-path", type=str, default="/tmp/VIRTUAL_imagenet256_labeled.npz")
     # output results
     parser.add_argument("--results-path", type=str, default="./results")
+    # GCS configuration
+    parser.add_argument("--gcs-project-id", type=str, default="flowmo", help="GCS project ID (optional, uses default if not specified)")
     args = parser.parse_args()
     main(args)

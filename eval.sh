@@ -4,6 +4,9 @@
 set -e
 set -o pipefail
 
+# GCS Authentication - uncomment and set the path to your service account key
+# export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account-key.json"
+
 # Arrays to track success and failure
 successful_runs=()
 failed_runs=()
@@ -13,12 +16,17 @@ log_with_timestamp() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# Function to create sample directory if it doesn't exist
+# Function to create sample directory if it doesn't exist (only for local paths)
 create_sample_dir() {
     local sample_dir="$1"
-    if [ ! -d "$sample_dir" ]; then
-        log_with_timestamp "Creating sample directory: $sample_dir"
-        mkdir -p "$sample_dir"
+    # Only create directory if it's a local path (not GCS)
+    if [[ ! "$sample_dir" =~ ^gs:// ]]; then
+        if [ ! -d "$sample_dir" ]; then
+            log_with_timestamp "Creating local sample directory: $sample_dir"
+            mkdir -p "$sample_dir"
+        fi
+    else
+        log_with_timestamp "Using GCS sample directory: $sample_dir"
     fi
 }
 
@@ -29,7 +37,8 @@ for num_steps in 1 2 4 8 16 32 64 128 256; do
     log_with_timestamp "Starting evaluation with num-inference-steps: $num_steps"
     
     # Create sample directory
-    sample_dir="temp/num_inference_steps_${num_steps}"
+    folder="gs://randar"
+    sample_dir="${folder}/num_inference_steps_${num_steps}"
     create_sample_dir "$sample_dir"
     
     # Run torchrun with error handling
@@ -41,12 +50,12 @@ for num_steps in 1 2 4 8 16 32 64 128 256; do
         --per-proc-batch-size 128 \
         --num-fid-samples-search 10000 \
         --num-fid-samples-report 50000 \
-        --results-path ./results \
+        --results-path results \
         --ref-path temp/VIRTUAL_imagenet256_labeled.npz \
         --sample-dir "$sample_dir" \
         --num-inference-steps $num_steps \
         --cfg-scales-interval 0.2 \
-        --cfg-scales-search 2.0,8.0; then
+        --cfg-scales-search 3.0,5.0; then
         # --cfg-optimal-scale 3.4
         
         log_with_timestamp "✓ SUCCESS: Completed evaluation with num-inference-steps: $num_steps"

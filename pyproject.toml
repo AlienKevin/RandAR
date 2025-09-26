@@ -11,4 +11,5 @@ dependencies = [
     "wandb",
     "tensorflow",
     "scipy",
+    "google-cloud-storage>=3.4.0",
 ]
