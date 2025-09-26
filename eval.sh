@@ -1,4 +1,4 @@
-torchrun tools/search_cfg_weights.py \
+torchrun --nproc-per-node=auto tools/search_cfg_weights.py \
     --config configs/randar/randar_l_0.3b_llamagen.yaml \
     --exp-name randar_0.3b_360k_llamagen \
     --gpt-ckpt temp/randar_0.3b_llamagen_360k_bs_1024_lr_0.0004.safetensors \
