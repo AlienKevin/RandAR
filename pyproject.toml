@@ -11,4 +11,5 @@ dependencies = [
     "wandb",
     "tensorflow",
     "scipy",
+    "matplotlib>=3.10.6",
 ]
